@@ -3,7 +3,11 @@ package main
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -17,8 +21,9 @@ import (
 )
 
 const (
-	HeartbeatInterval = 1 * time.Second
+	HeartbeatInterval = 1000 * time.Millisecond
 	HeartbeatKey      = "/heartbeat"
+	InfoFileName      = "info.json"
 )
 
 type Slave struct {
@@ -26,7 +31,8 @@ type Slave struct {
 	id          int
 	host        string
 	port        int
-	masterHosts []string
+	cmdport     int
+	masterAddrs []string
 	workdir     string
 	files       map[string]FileStore
 	stopC       <-chan struct{}
@@ -39,41 +45,85 @@ func (s *Slave) putFile(fs FileStore) {
 }
 
 func (s *Slave) sendHeartbeat() {
-	s.Lock()
-	defer s.Unlock()
+	s.RLock()
+	defer s.RUnlock()
 
 	var files []FileStore
 	for _, fs := range s.files {
 		files = append(files, fs)
 	}
 	p := heartbeatPackage{
-		SlaveId:    s.id,
-		SlaveHost:  s.host,
-		FileStores: files,
+		SlaveId:      s.id,
+		SlaveHost:    s.host,
+		SlavePort:    s.port,
+		SlaveCmdPort: s.cmdport,
+		FileStores:   files,
 	}
 	reqBody := p.mustMarshal()
-	for i := range s.masterHosts {
-		url := s.masterHosts[i] + HeartbeatKey
+	for i := range s.masterAddrs {
+		url := s.masterAddrs[i] + HeartbeatKey
 		if ok := http_put(url, reqBody); ok {
-			// log.Printf("[slave %d] successfully sending heartbeat to master %s", s.id, s.masterHosts[i])
+			// log.Printf("[slave %d] successfully sending heartbeat to master %s", s.id, s.masterAddrs[i])
 			return
 		}
-		// log.Printf("[slave %d] failed sending heartbeat to master %s", s.id, s.masterHosts[i])
+		// log.Printf("WARNING: [slave %d] failed sending heartbeat to master %s", s.id, s.masterAddrs[i])
 	}
 }
 
-func newSlave(id int, host string, port int, masterHosts []string, stopC chan struct{}) *Slave {
+func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, stopC chan struct{}) *Slave {
 	s := &Slave{
 		id:          id,
 		host:        host,
 		port:        port,
-		masterHosts: masterHosts,
+		cmdport:     cmdport,
+		masterAddrs: masterAddrs,
 		workdir:     "slave" + strconv.Itoa(id),
 		files:       make(map[string]FileStore),
 		stopC:       stopC,
 	}
 
 	os.Mkdir(s.workdir, os.ModePerm)
+
+	infoFilePath := filepath.Join(s.workdir, InfoFileName)
+	if pathExist(infoFilePath) {
+		infoFile, err := os.OpenFile(infoFilePath, os.O_RDONLY, 0664)
+		if err != nil {
+			panic(err)
+		}
+		defer infoFile.Close()
+
+		dec := json.NewDecoder(infoFile)
+		info := map[string]int{}
+		if err := dec.Decode(&info); err != nil {
+			panic(err)
+		}
+
+		dir, err := ioutil.ReadDir(s.workdir)
+		if err != nil {
+			panic(err)
+		}
+		for _, fi := range dir {
+			if fi.IsDir() {
+				continue
+			}
+			if getExtname(fi.Name()) != ".tsm" {
+				continue
+			}
+			path := filepath.Join(s.workdir, fi.Name())
+			file, err := os.OpenFile(path, os.O_RDONLY, 0664)
+			if err != nil {
+				panic(err)
+			}
+			fs := FileStore{
+				GroupId:  info["groupId"],
+				PeerId:   info["peerId"],
+				Filename: fi.Name(),
+				Md5sum:   hex.EncodeToString(mustMd5sum(file)),
+			}
+			s.files[fs.Filename] = fs
+			file.Close()
+		}
+	}
 
 	go func() {
 		for {
@@ -98,9 +148,29 @@ func newSlave(id int, host string, port int, masterHosts []string, stopC chan st
 			if err != nil {
 				panic(err)
 			}
-			log.Printf("accepted a connection from %s", conn.RemoteAddr())
+			log.Printf("accepted a connection from %s (receiving file)", conn.RemoteAddr())
 
 			go s.startRecvingFile(conn)
+		}
+	}()
+
+	go func() {
+		l, err := net.Listen("tcp", ":"+strconv.Itoa(cmdport))
+		if err != nil {
+			panic(err)
+		}
+		defer l.Close()
+
+		log.Printf("server listening at %d for master's files-copy command", cmdport)
+
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				panic(err)
+			}
+			log.Printf("accepted a connection from %s (files-copy command)", conn.RemoteAddr())
+
+			go s.startSendingFilesToPeer(conn)
 		}
 	}()
 
@@ -109,10 +179,11 @@ func newSlave(id int, host string, port int, masterHosts []string, stopC chan st
 
 func (s *Slave) startRecvingFile(conn net.Conn) {
 	defer conn.Close()
-	// receiving filename
+	// receiving tmpFilename
 	buf := make([]byte, 1024)
 	n := mustRead(conn, buf)
-	filename := string(buf[:n])
+	tmpFilename := string(buf[:n])
+	filename, groupId, peerId := parseTmpFilename(tmpFilename)
 	log.Printf("received filename \"%s\" from %s, responsing \"OK\"", filename, conn.RemoteAddr())
 	mustWrite(conn, []byte("OK"))
 
@@ -137,7 +208,6 @@ func (s *Slave) startRecvingFile(conn net.Conn) {
 	}
 
 	log.Printf("[%s - %s] DONE - md5 verification successful", conn.RemoteAddr(), filename)
-	groupId, peerId := extractGroupIdAndPeerIdFromFilename(filename)
 	fs := FileStore{
 		GroupId:  groupId,
 		PeerId:   peerId,
@@ -145,17 +215,72 @@ func (s *Slave) startRecvingFile(conn net.Conn) {
 		Md5sum:   hex.EncodeToString(md5sum),
 	}
 	s.putFile(fs)
+
+	infoFilePath := filepath.Join(s.workdir, InfoFileName)
+	if pathExist(infoFilePath) {
+		return // nothing needs to do
+	}
+	infoFile, err := os.OpenFile(infoFilePath, os.O_CREATE|os.O_RDWR, 0664)
+	if err != nil {
+		panic(err)
+	}
+	defer infoFile.Close()
+
+	enc := json.NewEncoder(infoFile)
+	info := map[string]int{"groupId": groupId, "peerId": peerId}
+	if err := enc.Encode(&info); err != nil {
+		panic(err)
+	}
+}
+
+func (s *Slave) startSendingFilesToPeer(conn net.Conn) {
+	defer conn.Close()
+
+	// receiving peer slave addr for sending files
+	buf := make([]byte, 100)
+	n := mustRead(conn, buf)
+	peerAddr := string(buf[:n])
+	// responding "OK
+	mustWrite(conn, []byte("OK"))
+
+	for _, f := range s.files {
+		path := filepath.Join(s.workdir, f.Filename)
+		ext := getExtname(f.Filename)
+		if ext != ".tsm" {
+			continue
+		}
+		err := sendFile(path, ext, peerAddr, f.GroupId, f.PeerId)
+		if err != nil {
+			log.Printf("slave %s unable to send file \"%s\" to the remote peer %s", s.host, path, peerAddr)
+		}
+	}
+}
+
+func getExtname(filename string) string {
+	toks := strings.Split(filename, ".")
+	return "." + toks[len(toks)-1]
+}
+
+func pathExist(path string) bool {
+	_, err := os.Stat(path)
+	if err == nil { // exist
+		return true
+	}
+	if os.IsNotExist(err) { // not exist
+		return false
+	}
+	panic(err)
 }
 
 func http_put(url string, reqBody string) bool {
 	req, err := http.NewRequest("PUT", url, strings.NewReader(reqBody))
 	if err != nil {
-		// log.Printf("failed to create http request: %v", err)
+		log.Printf("failed to create http request: %v", err)
 		return false
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		// log.Printf("http request error: %v", err)
+		log.Printf("http request error: %v", err)
 		return false
 	}
 	defer resp.Body.Close()
@@ -187,13 +312,93 @@ func doRecvFile(dir string, filename string, conn net.Conn) ([]byte, error) {
 	return md5sum, nil
 }
 
-// filename: ****_X_Y.***, X = groupId, Y = peerId
-func extractGroupIdAndPeerIdFromFilename(filename string) (int, int) {
-	toks := strings.Split(filename, "_")
-	groupId, _ := strconv.Atoi(toks[1])
-	toks2 := strings.Split(toks[2], ".")
-	peerId, _ := strconv.Atoi(toks2[0])
-	return groupId, peerId
+func sendFile(filepath, ext, server string, groupId, peerId int) error {
+	info, err := os.Stat(filepath)
+	if err != nil {
+		return err
+	}
+	filename := info.Name()
+	conn, err := net.Dial("tcp", server)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	f, err := os.Open(filepath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// sending filename
+	filename = attachGroupIdAndPeerIdToFilename(filename, ext, groupId, peerId)
+	log.Printf("[%s - %s] sending filename ", conn.RemoteAddr(), filename)
+	mustWrite(conn, []byte(filename))
+	// waiting for response
+	log.Printf("[%s - %s] waiting for response \"OK\"", conn.RemoteAddr(), filename)
+	buf := make([]byte, 10)
+	n := mustRead(conn, buf)
+	if string(buf[:n]) != "OK" {
+		return errors.New("failed sending filename")
+	}
+
+	// sending md5 sum
+	log.Printf("[%s - %s] sending md5 sum", conn.RemoteAddr(), filename)
+	md5sum := mustMd5sum(f)
+	mustWrite(conn, md5sum)
+	// waiting for response
+	log.Printf("[%s - %s] waiting for response \"OK\"", conn.RemoteAddr(), filename)
+	n = mustRead(conn, buf)
+	if string(buf[:n]) != "OK" {
+		return errors.New("failed sending md5 sum")
+	}
+
+	// sending file data
+	log.Printf("[%s - %s] sending file data", conn.RemoteAddr(), filename)
+	if err := doSendFile(f, conn); err != nil {
+		return err
+	}
+	return nil
+}
+
+func doSendFile(f *os.File, conn net.Conn) error {
+	if _, err := f.Seek(0, 0); err != nil {
+		panic(err)
+	}
+	buf := make([]byte, 10*1024*1024)
+	for {
+		n, err := f.Read(buf)
+		if err != nil {
+			if err == io.EOF && n == 0 {
+				return nil
+			} else {
+				return err
+			}
+		}
+		mustWrite(conn, buf[:n])
+	}
+}
+
+func attachGroupIdAndPeerIdToFilename(filename string, ext string, groupId int, peerId int) string {
+	// xxx.tsm -> xxx_<groupId>_<peerId>.tsm
+	name := strings.Split(filename, ext)[0]
+	return fmt.Sprintf("%s_%d_%d%s", name, groupId, peerId, ext)
+}
+
+func parseTmpFilename(tmpFilename string) (filename string, groudId int, peerId int) {
+	// xxx_<GID>_<PeerID>.yyy -> xxx_<GID>
+	toks1 := strings.Split(tmpFilename, ".") // toks1[0] = xxx_<GID>_<PeerID>, toks1[1] = yyy
+	toks2 := strings.Split(toks1[0], "_")    // toks2[0] = xxx, toks2[1] = <GID>, toks2[2] = <PeerID>
+	filename = toks2[0] + "." + toks1[1]
+	groudId, err := strconv.Atoi(toks2[1])
+	if err != nil {
+		panic(err)
+	}
+	peerId, err = strconv.Atoi(toks2[2])
+	if err != nil {
+		panic(err)
+	}
+	return
 }
 
 func mustRead(conn net.Conn, buf []byte) int {

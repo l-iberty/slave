@@ -1,3 +1,3 @@
-.idea
+.idea/
 slave
-slave[0-9]*
+slave[0-9]/

@@ -1,0 +1,1 @@
+rm slave[0-9] -rf

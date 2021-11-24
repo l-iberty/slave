@@ -179,11 +179,12 @@ func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 
 func (s *Slave) startRecvingFile(conn net.Conn) {
 	defer conn.Close()
-	// receiving tmpFilename
+	// receiving filename
 	buf := make([]byte, 1024)
 	n := mustRead(conn, buf)
-	tmpFilename := string(buf[:n])
-	filename, groupId, peerId := parseTmpFilename(tmpFilename)
+	filename := string(buf[:n])
+	dir, basename, groupId, peerId := parseFilename(filename)
+	filename = filepath.Join(dir, basename)
 	log.Printf("received filename \"%s\" from %s, responsing \"OK\"", filename, conn.RemoteAddr())
 	mustWrite(conn, []byte("OK"))
 
@@ -287,8 +288,11 @@ func http_put(url string, reqBody string) bool {
 	return true
 }
 
-func doRecvFile(dir string, filename string, conn net.Conn) ([]byte, error) {
-	f, err := os.Create(filepath.Join(dir, filename))
+func doRecvFile(workDir, filename string, conn net.Conn) ([]byte, error) {
+	dir := filepath.Join(workDir, filepath.Dir(filename))
+	os.MkdirAll(dir, 0777)
+
+	f, err := os.Create(filepath.Join(workDir, filename))
 	if err != nil {
 		return nil, err
 	}
@@ -312,25 +316,22 @@ func doRecvFile(dir string, filename string, conn net.Conn) ([]byte, error) {
 	return md5sum, nil
 }
 
-func sendFile(filepath, ext, server string, groupId, peerId int) error {
-	info, err := os.Stat(filepath)
-	if err != nil {
-		return err
-	}
-	filename := info.Name()
+func sendFile(filename, ext, server string, groupId, peerId int) error {
 	conn, err := net.Dial("tcp", server)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	f, err := os.Open(filepath)
+	f, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
 	// sending filename
+	idx := strings.Index(filename, "data/")
+	filename = filename[idx:]
 	filename = attachGroupIdAndPeerIdToFilename(filename, ext, groupId, peerId)
 	log.Printf("[%s - %s] sending filename ", conn.RemoteAddr(), filename)
 	mustWrite(conn, []byte(filename))
@@ -385,11 +386,12 @@ func attachGroupIdAndPeerIdToFilename(filename string, ext string, groupId int, 
 	return fmt.Sprintf("%s_%d_%d%s", name, groupId, peerId, ext)
 }
 
-func parseTmpFilename(tmpFilename string) (filename string, groudId int, peerId int) {
-	// xxx_<GID>_<PeerID>.yyy -> xxx_<GID>
-	toks1 := strings.Split(tmpFilename, ".") // toks1[0] = xxx_<GID>_<PeerID>, toks1[1] = yyy
-	toks2 := strings.Split(toks1[0], "_")    // toks2[0] = xxx, toks2[1] = <GID>, toks2[2] = <PeerID>
-	filename = toks2[0] + "." + toks1[1]
+func parseFilename(filename string) (dir, basename string, groudId int, peerId int) {
+	dir = filepath.Dir(filename)
+	basename = filepath.Base(filename)
+	toks1 := strings.Split(basename, ".") // toks1[0] = xxx_<GID>_<PeerID>, toks1[1] = yyy
+	toks2 := strings.Split(toks1[0], "_") // toks2[0] = xxx, toks2[1] = <GID>, toks2[2] = <PeerID>
+	basename = toks2[0] + "." + toks1[1]  // basename = xxx.yyy
 	groudId, err := strconv.Atoi(toks2[1])
 	if err != nil {
 		panic(err)

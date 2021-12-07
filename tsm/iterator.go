@@ -2,12 +2,13 @@ package util
 
 import (
 	"fmt"
-	"github.com/influxdata/influxdb/query"
-	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/influxdata/influxdb/query"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
 
 var (
@@ -179,4 +180,116 @@ func (t *TSMIterator) Stats() query.IteratorStats {
 func (t *TSMIterator) Close() error {
 	t.Reset()
 	return nil
+}
+
+func (t *TSMIterator) ConvertToQueryIterators() []query.Iterator {
+	var iters []query.Iterator
+
+	floatItr := newFloatIterator()
+	integerItr := newIntegerIterator()
+
+	for t.HasNextKey() {
+		key, _ := t.NextKey()
+		for t.HasNextPoint() {
+			p := t.NextPoint()
+			switch p.(type) {
+			case *query.FloatPoint:
+				floatItr.put(key, p.(*query.FloatPoint))
+			case *query.IntegerPoint:
+				integerItr.put(key, p.(*query.IntegerPoint))
+			case *query.UnsignedPoint:
+			case *query.StringPoint:
+			case *query.BooleanPoint:
+			}
+		}
+	}
+
+	// iters = append(iters, floatItr)
+	iters = append(iters, integerItr)
+
+	return iters
+}
+
+type floatIterator struct {
+	idx    int
+	points []*query.FloatPoint
+	series map[string]struct{}
+}
+
+func newFloatIterator() *floatIterator {
+	return &floatIterator{
+		points: []*query.FloatPoint{},
+		series: make(map[string]struct{}),
+	}
+}
+
+func (itr *floatIterator) put(key []byte, p *query.FloatPoint) {
+	s, _ := tsm1.SeriesAndFieldFromCompositeKey(key)
+	itr.series[string(s)] = struct{}{}
+	itr.points = append(itr.points, p)
+}
+
+func (itr *floatIterator) Stats() query.IteratorStats {
+	return query.IteratorStats{
+		SeriesN: len(itr.series),
+		PointN:  len(itr.points),
+	}
+}
+
+func (itr *floatIterator) Close() error {
+	itr.idx = 0
+	itr.points = nil
+	itr.series = nil
+	return nil
+}
+
+func (itr *floatIterator) Next() (*query.FloatPoint, error) {
+	if itr.idx < 0 || itr.idx >= len(itr.points) {
+		return nil, ErrNoMorePoints
+	}
+	idx := itr.idx
+	itr.idx++
+	return itr.points[idx], nil
+}
+
+type integerIterator struct {
+	idx    int
+	points []*query.IntegerPoint
+	series map[string]struct{}
+}
+
+func newIntegerIterator() *integerIterator {
+	return &integerIterator{
+		points: []*query.IntegerPoint{},
+		series: make(map[string]struct{}),
+	}
+}
+
+func (itr *integerIterator) put(key []byte, p *query.IntegerPoint) {
+	s, _ := tsm1.SeriesAndFieldFromCompositeKey(key)
+	itr.series[string(s)] = struct{}{}
+	itr.points = append(itr.points, p)
+}
+
+func (itr *integerIterator) Stats() query.IteratorStats {
+	return query.IteratorStats{
+		SeriesN: len(itr.series),
+		PointN:  len(itr.points),
+	}
+}
+
+func (itr *integerIterator) Close() error {
+	itr.idx = 0
+	itr.points = nil
+	itr.series = nil
+	return nil
+}
+
+func (itr *integerIterator) Next() (*query.IntegerPoint, error) {
+	if itr.idx < 0 || itr.idx >= len(itr.points) {
+		return nil, ErrNoMorePoints
+	}
+	idx := itr.idx
+	itr.idx++
+	return itr.points[idx], nil
 }

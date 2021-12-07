@@ -17,6 +17,17 @@ func main() {
 	log.Printf("id: %d, addr: %s:%d, masterAddrs: %s", *id, *host, *port, *masterAddrs)
 
 	stopC := make(chan struct{})
-	newSlave(*id, *host, *port, *cmdport, strings.Split(*masterAddrs, ","), stopC)
-	<-stopC
+	fileC := make(chan string, 10)
+	s := NewSlave(*id, *host, *port, *cmdport, strings.Split(*masterAddrs, ","), stopC, fileC)
+	go s.Run()
+
+	for {
+		select {
+		case file := <-fileC:
+			log.Printf("file: %s", file)
+		case <-stopC:
+			log.Print("stop")
+			return
+		}
+	}
 }

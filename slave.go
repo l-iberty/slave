@@ -35,13 +35,18 @@ type Slave struct {
 	masterAddrs []string
 	workdir     string
 	files       map[string]FileStore
-	stopC       <-chan struct{}
+	fileC       chan<- string
+	stopC       chan<- struct{}
 }
 
 func (s *Slave) putFile(fs FileStore) {
 	s.Lock()
 	defer s.Unlock()
-	s.files[fs.Filename] = fs
+
+	if _, ok := s.files[fs.Filename]; !ok {
+		s.files[fs.Filename] = fs
+		go func() { s.fileC <- fs.Filename }()
+	}
 }
 
 func (s *Slave) sendHeartbeat() {
@@ -70,7 +75,7 @@ func (s *Slave) sendHeartbeat() {
 	}
 }
 
-func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, stopC chan struct{}) *Slave {
+func NewSlave(id int, host string, port int, cmdport int, masterAddrs []string, stopC chan struct{}, fileC chan string) *Slave {
 	s := &Slave{
 		id:          id,
 		host:        host,
@@ -79,9 +84,13 @@ func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 		masterAddrs: masterAddrs,
 		workdir:     "slave" + strconv.Itoa(id),
 		files:       make(map[string]FileStore),
+		fileC:       fileC,
 		stopC:       stopC,
 	}
+	return s
+}
 
+func (s *Slave) Run() {
 	os.Mkdir(s.workdir, os.ModePerm)
 
 	infoFilePath := filepath.Join(s.workdir, InfoFileName)
@@ -135,13 +144,13 @@ func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 	}()
 
 	go func() {
-		l, err := net.Listen("tcp", ":"+strconv.Itoa(port))
+		l, err := net.Listen("tcp", ":"+strconv.Itoa(s.port))
 		if err != nil {
 			panic(err)
 		}
 		defer l.Close()
 
-		log.Printf("server listening at %d for receiving file", port)
+		log.Printf("server listening at %d for receiving file", s.port)
 
 		for {
 			conn, err := l.Accept()
@@ -155,13 +164,13 @@ func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 	}()
 
 	go func() {
-		l, err := net.Listen("tcp", ":"+strconv.Itoa(cmdport))
+		l, err := net.Listen("tcp", ":"+strconv.Itoa(s.cmdport))
 		if err != nil {
 			panic(err)
 		}
 		defer l.Close()
 
-		log.Printf("server listening at %d for master's files-copy command", cmdport)
+		log.Printf("server listening at %d for master's files-copy command", s.cmdport)
 
 		for {
 			conn, err := l.Accept()
@@ -174,7 +183,6 @@ func newSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 		}
 	}()
 
-	return s
 }
 
 func (s *Slave) startRecvingFile(conn net.Conn) {
@@ -183,6 +191,7 @@ func (s *Slave) startRecvingFile(conn net.Conn) {
 	buf := make([]byte, 1024)
 	n := mustRead(conn, buf)
 	filename := string(buf[:n])
+	filename = correctSeparator(filename)
 	dir, basename, groupId, peerId := parseFilename(filename)
 	filename = filepath.Join(dir, basename)
 	log.Printf("received filename \"%s\" from %s, responsing \"OK\"", filename, conn.RemoteAddr())
@@ -428,4 +437,11 @@ func mustMd5sum(f *os.File) []byte {
 		panic(err)
 	}
 	return md5sum.Sum(nil)
+}
+
+func correctSeparator(s string) string {
+	sep := fmt.Sprintf("%c", filepath.Separator)
+	s = strings.ReplaceAll(s, "\\", sep)
+	s = strings.ReplaceAll(s, "/", sep)
+	return s
 }

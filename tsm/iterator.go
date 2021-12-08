@@ -1,8 +1,9 @@
 package util
 
 import (
-	"fmt"
+	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,8 +12,9 @@ import (
 	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
 
-var (
-	ErrNoMorePoints = fmt.Errorf("no more points")
+const (
+	floatPointType   = 0
+	integerPointType = 1
 )
 
 type TSMIterator struct {
@@ -22,17 +24,34 @@ type TSMIterator struct {
 	tsmIndex int
 	keyIndex int
 
+	curKey     []byte
+	curKeyType byte
+
+	curFloatKey   []byte
+	curIntegerKey []byte
+
 	values   []tsm1.Value // values of current key
 	valIndex int
 
-	stats query.IteratorStats
+	series map[string]struct{}
+	pointN int
+
+	floatItr   *floatIterator
+	integerItr *integerIterator
+
+	stopC   chan struct{}
+	notifyC chan int
 }
 
 func NewTSMIterator(dir string) *TSMIterator {
-	iter := &TSMIterator{}
+	itr := &TSMIterator{
+		series:  make(map[string]struct{}),
+		stopC:   make(chan struct{}),
+		notifyC: make(chan int),
+	}
 
-	iter.files = mustGetTsmFilesFromDir(dir)
-	for _, f := range iter.files {
+	itr.files = mustGetTsmFilesFromDir(dir)
+	for _, f := range itr.files {
 		file, err := os.Open(f)
 		if err != nil {
 			panic(err)
@@ -41,10 +60,10 @@ func NewTSMIterator(dir string) *TSMIterator {
 		if err != nil {
 			panic(err)
 		}
-		iter.readers = append(iter.readers, r)
+		itr.readers = append(itr.readers, r)
 	}
 
-	return iter
+	return itr
 }
 
 func mustGetTsmFilesFromDir(dirname string) []string {
@@ -87,15 +106,15 @@ func (t *TSMIterator) NextKey() ([]byte, byte) {
 		panic("tsmIndex out of bound")
 	}
 
-	key, typ := t.readers[t.tsmIndex].KeyAt(t.keyIndex)
-	values, err := t.readers[t.tsmIndex].ReadAll(key)
+	t.curKey, t.curKeyType = t.readers[t.tsmIndex].KeyAt(t.keyIndex)
+	values, err := t.readers[t.tsmIndex].ReadAll(t.curKey)
 	if err != nil {
 		panic(err)
 	}
 	t.keyIndex++
 	t.values = values
 	t.valIndex = 0
-	return key, typ
+	return t.curKey, t.curKeyType
 }
 
 func (t *TSMIterator) Values() []tsm1.Value {
@@ -144,37 +163,31 @@ func (t *TSMIterator) Reset() {
 	t.keyIndex = 0
 	t.values = []tsm1.Value{}
 	t.valIndex = 0
-	t.stats = query.IteratorStats{}
+	t.series = make(map[string]struct{})
+	t.pointN = 0
 }
 
-func (t *TSMIterator) Walk() error {
+func (t *TSMIterator) Walk() {
 	for t.HasNextKey() {
-		t.NextKey()
+		key, _ := t.NextKey()
+		s, _ := tsm1.SeriesAndFieldFromCompositeKey(key)
 		values := t.Values()
 		t.mu.Lock()
-		t.stats.PointN += len(values)
+		t.series[string(s)] = struct{}{}
+		t.pointN += len(values)
 		t.mu.Unlock()
 	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	for _, r := range t.readers {
-		t.stats.SeriesN += r.KeyCount()
-	}
-	return nil
 }
 
 func (t *TSMIterator) Stats() query.IteratorStats {
 	t.Reset()
-	if err := t.Walk(); err != nil {
-		t.Reset()
-		return query.IteratorStats{}
+	t.Walk()
+	stats := query.IteratorStats{
+		SeriesN: len(t.series),
+		PointN:  t.pointN,
 	}
-
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.stats
+	t.Reset()
+	return stats
 }
 
 func (t *TSMIterator) Close() error {
@@ -182,44 +195,72 @@ func (t *TSMIterator) Close() error {
 	return nil
 }
 
-func (t *TSMIterator) ConvertToQueryIterators() []query.Iterator {
-	var iters []query.Iterator
-
-	floatItr := newFloatIterator()
-	integerItr := newIntegerIterator()
-
-	for t.HasNextKey() {
-		key, _ := t.NextKey()
+func (t *TSMIterator) stepFloatPoint() {
+	for {
 		for t.HasNextPoint() {
 			p := t.NextPoint()
 			switch p.(type) {
 			case *query.FloatPoint:
-				floatItr.put(key, p.(*query.FloatPoint))
-			case *query.IntegerPoint:
-				integerItr.put(key, p.(*query.IntegerPoint))
-			case *query.UnsignedPoint:
-			case *query.StringPoint:
-			case *query.BooleanPoint:
+				t.floatItr.entryC <- &floatEntry{key: t.curFloatKey, point: p.(*query.FloatPoint)}
+				return
 			}
 		}
+		if t.HasNextKey() {
+			t.NextKey()
+		} else {
+			return
+		}
 	}
+}
 
-	// iters = append(iters, floatItr)
-	iters = append(iters, integerItr)
+func (t *TSMIterator) eventLoop() {
+	for {
+		select {
+		case <-t.stopC:
+			return
+		case typ := <-t.notifyC:
+			log.Printf("eventLoop type: %d", typ)
+			t.step(typ)
+		}
+	}
+}
 
-	return iters
+func (t *TSMIterator) EncodeIterators(w io.Writer) error {
+	floatEntryC := make(chan *floatEntry, 1000)
+	integerEntryC := make(chan *integerEntry, 1000)
+	t.floatItr = newFloatIterator(t.notifyC, floatEntryC)
+	t.integerItr = newIntegerIterator(t.notifyC, integerEntryC)
+
+	go t.eventLoop()
+	defer func() { t.stopC <- struct{}{} }()
+
+	enc := query.NewIteratorEncoder(w)
+	itrs := []query.Iterator{t.floatItr, t.integerItr}
+	for _, itr := range itrs {
+		if err := enc.EncodeIterator(itr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type floatEntry struct {
+	key   []byte
+	point *query.FloatPoint
 }
 
 type floatIterator struct {
-	idx    int
-	points []*query.FloatPoint
-	series map[string]struct{}
+	points  []*query.FloatPoint
+	series  map[string]struct{}
+	notifyC chan int
+	entryC  chan *floatEntry
 }
 
-func newFloatIterator() *floatIterator {
+func newFloatIterator(notifyC chan int, entryC chan *floatEntry) *floatIterator {
 	return &floatIterator{
-		points: []*query.FloatPoint{},
-		series: make(map[string]struct{}),
+		series:  make(map[string]struct{}),
+		notifyC: notifyC,
+		entryC:  entryC,
 	}
 }
 
@@ -237,31 +278,44 @@ func (itr *floatIterator) Stats() query.IteratorStats {
 }
 
 func (itr *floatIterator) Close() error {
-	itr.idx = 0
 	itr.points = nil
 	itr.series = nil
+	close(itr.notifyC)
+	close(itr.entryC)
 	return nil
 }
 
 func (itr *floatIterator) Next() (*query.FloatPoint, error) {
-	if itr.idx < 0 || itr.idx >= len(itr.points) {
-		return nil, ErrNoMorePoints
+	itr.notifyC <- floatPointType
+	select {
+	case e := <-itr.entryC:
+		if e != nil {
+			s, _ := tsm1.SeriesAndFieldFromCompositeKey(e.key)
+			itr.series[string(s)] = struct{}{}
+			log.Print("float point")
+			return e.point, nil
+		}
 	}
-	idx := itr.idx
-	itr.idx++
-	return itr.points[idx], nil
+	return nil, nil
+}
+
+type integerEntry struct {
+	key   []byte
+	point *query.IntegerPoint
 }
 
 type integerIterator struct {
-	idx    int
-	points []*query.IntegerPoint
-	series map[string]struct{}
+	points  []*query.IntegerPoint
+	series  map[string]struct{}
+	notifyC chan int
+	entryC  chan *integerEntry
 }
 
-func newIntegerIterator() *integerIterator {
+func newIntegerIterator(notifyC chan int, entryC chan *integerEntry) *integerIterator {
 	return &integerIterator{
-		points: []*query.IntegerPoint{},
-		series: make(map[string]struct{}),
+		series:  make(map[string]struct{}),
+		notifyC: notifyC,
+		entryC:  entryC,
 	}
 }
 
@@ -279,17 +333,23 @@ func (itr *integerIterator) Stats() query.IteratorStats {
 }
 
 func (itr *integerIterator) Close() error {
-	itr.idx = 0
 	itr.points = nil
 	itr.series = nil
+	close(itr.notifyC)
+	close(itr.entryC)
 	return nil
 }
 
 func (itr *integerIterator) Next() (*query.IntegerPoint, error) {
-	if itr.idx < 0 || itr.idx >= len(itr.points) {
-		return nil, ErrNoMorePoints
+	itr.notifyC <- integerPointType
+	select {
+	case e := <-itr.entryC:
+		if e != nil {
+			s, _ := tsm1.SeriesAndFieldFromCompositeKey(e.key)
+			itr.series[string(s)] = struct{}{}
+			log.Print("integer point")
+			return e.point, nil
+		}
 	}
-	idx := itr.idx
-	itr.idx++
-	return itr.points[idx], nil
+	return nil, nil
 }

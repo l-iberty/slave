@@ -1,0 +1,26 @@
+[
+	{
+		"Name1":"Float",
+		"Name2":"Float64",
+		"name1":"float",
+		"name2":"float64"
+	},
+	{
+		"Name1":"Integer",
+		"Name2":"Integer",
+		"name1":"integer",
+		"name2":"int64"
+	},
+	{
+		"Name1":"String",
+		"Name2":"String",
+		"name1":"string",
+		"name2":"string"
+	},
+	{
+		"Name1":"Boolean",
+		"Name2":"Boolean",
+		"name1":"boolean",
+		"name2":"bool"
+	}
+]

@@ -12,8 +12,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +27,7 @@ const (
 	HeartbeatInterval = 1000 * time.Millisecond
 	HeartbeatKey      = "/heartbeat"
 	InfoFileName      = "info.json"
+	DataFileName      = "data.txt"
 )
 
 type Slave struct {
@@ -37,6 +41,8 @@ type Slave struct {
 	files       map[string]FileStore
 	fileC       chan<- string
 	stopC       chan<- struct{}
+
+	fileMu sync.Mutex
 }
 
 func (s *Slave) putFile(fs FileStore) {
@@ -183,10 +189,19 @@ func (s *Slave) Run() {
 		}
 	}()
 
+	go func() {
+		select {
+		case <-time.After(10 * time.Second):
+			s.backupFileToInfluxDB()
+		}
+	}()
 }
 
 func (s *Slave) startRecvingFile(conn net.Conn) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
 	defer conn.Close()
+
 	// receiving filename
 	buf := make([]byte, 1024)
 	n := mustRead(conn, buf)
@@ -244,6 +259,8 @@ func (s *Slave) startRecvingFile(conn net.Conn) {
 }
 
 func (s *Slave) startSendingFilesToPeer(conn net.Conn) {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
 	defer conn.Close()
 
 	// receiving peer slave addr for sending files
@@ -263,6 +280,42 @@ func (s *Slave) startSendingFilesToPeer(conn net.Conn) {
 		if err != nil {
 			log.Printf("slave %s unable to send file \"%s\" to the remote peer %s", s.host, path, peerAddr)
 		}
+	}
+}
+
+func (s *Slave) backupFileToInfluxDB() {
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+
+	_, filename, _, ok := runtime.Caller(1)
+	if !ok {
+		log.Fatal("Unable to get current path.")
+	}
+	currentPath := path.Dir(filename)
+	datadir := filepath.Join(currentPath, s.workdir, "data")
+	dataFilePath := filepath.Join(currentPath, s.workdir, DataFileName)
+
+	cmd := exec.Command("./bin/influx_inspect", "export", "-datadir", datadir, "-out", dataFilePath)
+	err := cmd.Run()
+	if err != nil {
+		log.Print("Failed to export data file:", err)
+		return
+	}
+	log.Print("Succeeded to export data file")
+
+	cmd = exec.Command("./bin/influx", "-import", fmt.Sprintf("-path=%s", dataFilePath))
+	err = cmd.Run()
+	if err != nil {
+		log.Print("Failed to import file to InfluxDB:", err)
+		return
+	}
+	log.Print("Succeeded to import file to InfluxDB")
+
+	// TSM 已被转移到 influxDB, 将 workdir 里的相关文件删除
+	// TODO 修改 s.files 里相关文件的记录项
+	dir, _ := ioutil.ReadDir(s.workdir)
+	for _, f := range dir {
+		os.RemoveAll(filepath.Join(s.workdir, f.Name()))
 	}
 }
 

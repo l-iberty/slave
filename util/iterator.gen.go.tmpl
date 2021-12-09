@@ -1,0 +1,317 @@
+package util
+
+import (
+	"fmt"
+	"io"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"github.com/influxdata/influxdb/query"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
+)
+
+type TSMIterator struct {
+	mu       sync.RWMutex
+	encoders []IteratorEncoder
+}
+
+type IteratorEncoder interface {
+	Encode(w io.Writer) error
+	Stats() query.IteratorStats
+	Series() map[string]struct{}
+}
+
+func NewTSMIterator(dir string, batchSize int) *TSMIterator {
+	var files []string
+	var readers []*tsm1.TSMReader
+
+	files = mustGetTSMFilesFromDir(dir)
+	for _, f := range files {
+		file, err := os.Open(f)
+		if err != nil {
+			panic(err)
+		}
+		r, err := tsm1.NewTSMReader(file)
+		if err != nil {
+			panic(err)
+		}
+		readers = append(readers, r)
+	}
+
+	t := &TSMIterator{}
+	t.encoders = []IteratorEncoder{
+{{range .}}NewTSM{{.Name1}}Iterator(readers, batchSize),
+{{end}}
+	}
+
+	return t
+}
+
+func (t *TSMIterator) Encode(w io.Writer) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	for _, enc := range t.encoders {
+		if err := enc.Encode(w); err != nil {
+			return err
+		}
+		fmt.Printf("%T: %+v\n", enc, enc.Stats())
+	}
+	return nil
+}
+
+func (t *TSMIterator) Stats() query.IteratorStats {
+	stats := query.IteratorStats{}
+	series := make(map[string]struct{})
+	for _, enc := range t.encoders {
+		stats.PointN += enc.Stats().PointN
+		for k := range enc.Series() {
+			series[k] = struct{}{}
+		}
+	}
+	stats.SeriesN = len(series)
+	return stats
+}
+
+func mustGetTSMFilesFromDir(dirname string) []string {
+	var files []string
+
+	dir, err := ioutil.ReadDir(dirname)
+	if err != nil {
+		panic(err)
+	}
+
+	for _, f := range dir {
+		if f.IsDir() {
+			continue
+		}
+		path := filepath.Join(dirname, f.Name())
+		files = append(files, path)
+	}
+	return files
+}
+
+{{range .}}
+
+type TSM{{.Name1}}Iterator struct {
+	readers  []*tsm1.TSMReader
+	tsmIndex int
+
+	key      []byte // current key
+	keyIndex int
+	values   []tsm1.Value // values of current key
+	valIndex int
+
+	series map[string]struct{}
+	pointN int
+
+	itr       *{{.name1}}Iterator
+	batchSize int
+
+	stopC   chan struct{}
+	notifyC chan struct{}
+}
+
+func NewTSM{{.Name1}}Iterator(readers []*tsm1.TSMReader, batchSize int) *TSM{{.Name1}}Iterator {
+	itr := &TSM{{.Name1}}Iterator{
+		readers:   readers,
+		series:    make(map[string]struct{}),
+		batchSize: batchSize,
+		stopC:     make(chan struct{}),
+		notifyC:   make(chan struct{}),
+	}
+	return itr
+}
+
+func (t *TSM{{.Name1}}Iterator) NextKey() ([]byte, byte) {
+	return t.nextKey()
+}
+
+func (t *TSM{{.Name1}}Iterator) nextKey() ([]byte, byte) {
+	var key []byte
+	var typ byte
+
+	for {
+		if t.tsmIndex == len(t.readers) {
+			return nil, 0
+		}
+		if t.keyIndex == t.readers[t.tsmIndex].KeyCount() {
+			t.tsmIndex++
+			t.keyIndex = 0
+		}
+		if t.tsmIndex == len(t.readers) {
+			return nil, 0
+		}
+
+		key, typ = t.readers[t.tsmIndex].KeyAt(t.keyIndex)
+		if typ == tsm1.Block{{.Name2}} {
+			break
+		}
+		t.keyIndex++
+	}
+
+	values, err := t.readers[t.tsmIndex].ReadAll(key)
+	if err != nil {
+		panic(err)
+	}
+	t.key = key
+	t.keyIndex++
+	t.values = values
+	t.valIndex = 0
+
+	return key, typ
+}
+
+func (t *TSM{{.Name1}}Iterator) Values() []tsm1.Value {
+	return t.values
+}
+
+func (t *TSM{{.Name1}}Iterator) Series() map[string]struct{} {
+	return t.series
+}
+
+func (t *TSM{{.Name1}}Iterator) NextPoint() *query.{{.Name1}}Point {
+	if t.valIndex == len(t.values) {
+		key, _ := t.nextKey()
+		if key == nil {
+			return nil
+		}
+		t.valIndex = 0
+	}
+
+	v := t.values[t.valIndex]
+	t.valIndex++
+	switch v.(type) {
+	case tsm1.{{.Name1}}Value:
+		return &query.{{.Name1}}Point{Time: v.UnixNano(), Value: v.Value().({{.name2}})}
+	default:
+		panic("only {{.Name1}}Value allowed")
+	}
+}
+
+func (t *TSM{{.Name1}}Iterator) walk() {
+	for {
+		key, _ := t.nextKey()
+		if key == nil {
+			break
+		}
+		s, _ := tsm1.SeriesAndFieldFromCompositeKey(key)
+		t.series[string(s)] = struct{}{}
+		t.pointN += len(t.values)
+	}
+}
+
+func (t *TSM{{.Name1}}Iterator) Stats() query.IteratorStats {
+	if len(t.series) == 0 || t.pointN == 0 {
+		t.walk()
+	}
+	stats := query.IteratorStats{
+		SeriesN: len(t.series),
+		PointN:  t.pointN,
+	}
+	return stats
+}
+
+func (t *TSM{{.Name1}}Iterator) Close() error {
+	return nil
+}
+
+func (t *TSM{{.Name1}}Iterator) step() {
+	batch := make([]*{{.name1}}Entry, 0, t.batchSize)
+	for i := 0; i < t.batchSize; i++ {
+		p := t.NextPoint()
+		if p == nil {
+			break
+		}
+		batch = append(batch, &{{.name1}}Entry{key: t.key, point: p})
+
+		s, _ := tsm1.SeriesAndFieldFromCompositeKey(t.key)
+		t.series[string(s)] = struct{}{}
+		t.pointN++
+	}
+	t.itr.entriesC <- batch
+}
+
+func (t *TSM{{.Name1}}Iterator) eventLoop() {
+	for {
+		select {
+		case <-t.stopC:
+			return
+		case <-t.notifyC:
+			t.step()
+		}
+	}
+}
+
+func (t *TSM{{.Name1}}Iterator) Encode(w io.Writer) error {
+	entriesC := make(chan []*{{.name1}}Entry)
+	t.itr = new{{.Name1}}Iterator(t.notifyC, entriesC)
+
+	go t.eventLoop()
+	defer close(t.stopC)
+
+	enc := query.NewIteratorEncoder(w)
+	if err := enc.EncodeIterator(t.itr); err != nil {
+		return err
+	}
+	return nil
+}
+
+type {{.name1}}Entry struct {
+	key   []byte
+	point *query.{{.Name1}}Point
+}
+
+type {{.name1}}Iterator struct {
+	pointN   int
+	series   map[string]struct{}
+	notifyC  chan struct{}
+	entriesC chan []*{{.name1}}Entry
+	batch    []*{{.name1}}Entry
+}
+
+func new{{.Name1}}Iterator(notifyC chan struct{}, entryC chan []*{{.name1}}Entry) *{{.name1}}Iterator {
+	return &{{.name1}}Iterator{
+		series:   make(map[string]struct{}),
+		notifyC:  notifyC,
+		entriesC: entryC,
+	}
+}
+
+func (itr *{{.name1}}Iterator) Stats() query.IteratorStats {
+	return query.IteratorStats{
+		SeriesN: len(itr.series),
+		PointN:  itr.pointN,
+	}
+}
+
+func (itr *{{.name1}}Iterator) Close() error {
+	itr.pointN = 0
+	itr.series = nil
+	close(itr.notifyC)
+	close(itr.entriesC)
+	return nil
+}
+
+func (itr *{{.name1}}Iterator) Next() (*query.{{.Name1}}Point, error) {
+	if len(itr.batch) == 0 {
+		itr.notifyC <- struct{}{}
+		select {
+		case batch := <-itr.entriesC:
+			itr.batch = batch
+		}
+	}
+	if len(itr.batch) == 0 {
+		return nil, nil
+	}
+	p := itr.batch[0]
+	itr.batch = itr.batch[1:]
+	s, _ := tsm1.SeriesAndFieldFromCompositeKey(p.key)
+	itr.series[string(s)] = struct{}{}
+	itr.pointN++
+	return p.point, nil
+}
+
+{{end}}

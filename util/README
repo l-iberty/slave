@@ -1,0 +1,5 @@
+非常简陋的 TSM 迭代器, 可以按数据类型遍历 TSM 里的 point.
+
+最初是为了实现远程查询而设计. 远端 influxdb 节点发送“创建迭代器”的请求到 slave 节点, slave 节点通过 TSMIterator 将 TSM 里的 point 编码进连接缓冲区.
+
+写到后面的时候发现这种方法根本行不通, 所以这个 package 下面的代码就没用了.

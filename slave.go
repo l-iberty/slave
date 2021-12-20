@@ -13,10 +13,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,10 +26,13 @@ const (
 	HeartbeatKey      = "/heartbeat"
 	InfoFileName      = "info.json"
 	DataFileName      = "data.txt"
+	BackupDirName     = "bak"
+	DataDirName       = "data"
 )
 
 type Slave struct {
-	sync.RWMutex
+	mu          sync.RWMutex
+	fileMu      sync.Mutex
 	id          int
 	host        string
 	port        int
@@ -39,49 +40,10 @@ type Slave struct {
 	masterAddrs []string
 	workdir     string
 	files       map[string]FileStore
-	fileC       chan<- string
 	stopC       chan<- struct{}
-
-	fileMu sync.Mutex
 }
 
-func (s *Slave) putFile(fs FileStore) {
-	s.Lock()
-	defer s.Unlock()
-
-	if _, ok := s.files[fs.Filename]; !ok {
-		s.files[fs.Filename] = fs
-		go func() { s.fileC <- fs.Filename }()
-	}
-}
-
-func (s *Slave) sendHeartbeat() {
-	s.RLock()
-	defer s.RUnlock()
-
-	var files []FileStore
-	for _, fs := range s.files {
-		files = append(files, fs)
-	}
-	p := heartbeatPackage{
-		SlaveId:      s.id,
-		SlaveHost:    s.host,
-		SlavePort:    s.port,
-		SlaveCmdPort: s.cmdport,
-		FileStores:   files,
-	}
-	reqBody := p.mustMarshal()
-	for i := range s.masterAddrs {
-		url := s.masterAddrs[i] + HeartbeatKey
-		if ok := http_put(url, reqBody); ok {
-			// log.Printf("[slave %d] successfully sending heartbeat to master %s", s.id, s.masterAddrs[i])
-			return
-		}
-		// log.Printf("WARNING: [slave %d] failed sending heartbeat to master %s", s.id, s.masterAddrs[i])
-	}
-}
-
-func NewSlave(id int, host string, port int, cmdport int, masterAddrs []string, stopC chan struct{}, fileC chan string) *Slave {
+func NewSlave(id int, host string, port int, cmdport int, masterAddrs []string, stopC chan struct{}) *Slave {
 	s := &Slave{
 		id:          id,
 		host:        host,
@@ -90,15 +52,14 @@ func NewSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 		masterAddrs: masterAddrs,
 		workdir:     "slave" + strconv.Itoa(id),
 		files:       make(map[string]FileStore),
-		fileC:       fileC,
 		stopC:       stopC,
 	}
+	os.Mkdir(s.workdir, os.ModePerm)
+
 	return s
 }
 
 func (s *Slave) Run() {
-	os.Mkdir(s.workdir, os.ModePerm)
-
 	infoFilePath := filepath.Join(s.workdir, InfoFileName)
 	if pathExist(infoFilePath) {
 		infoFile, err := os.OpenFile(infoFilePath, os.O_RDONLY, 0664)
@@ -190,11 +151,39 @@ func (s *Slave) Run() {
 	}()
 
 	go func() {
-		select {
-		case <-time.After(10 * time.Second):
-			s.backupFileToInfluxDB()
+		for {
+			select {
+			case <-time.After(5 * time.Second):
+				s.backupFileToInfluxDB()
+			}
 		}
 	}()
+}
+
+func (s *Slave) sendHeartbeat() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var files []FileStore
+	for _, fs := range s.files {
+		files = append(files, fs)
+	}
+	p := heartbeatPackage{
+		SlaveId:      s.id,
+		SlaveHost:    s.host,
+		SlavePort:    s.port,
+		SlaveCmdPort: s.cmdport,
+		FileStores:   files,
+	}
+	reqBody := p.mustMarshal()
+	for i := range s.masterAddrs {
+		url := s.masterAddrs[i] + HeartbeatKey
+		if ok := http_put(url, reqBody); ok {
+			// log.Printf("[slave %d] successfully sending heartbeat to master %s", s.id, s.masterAddrs[i])
+			return
+		}
+		// log.Printf("WARNING: [slave %d] failed sending heartbeat to master %s", s.id, s.masterAddrs[i])
+	}
 }
 
 func (s *Slave) startRecvingFile(conn net.Conn) {
@@ -239,7 +228,9 @@ func (s *Slave) startRecvingFile(conn net.Conn) {
 		Filename: filename,
 		Md5sum:   hex.EncodeToString(md5sum),
 	}
-	s.putFile(fs)
+	s.mu.Lock()
+	s.files[fs.Filename] = fs
+	s.mu.Unlock()
 
 	infoFilePath := filepath.Join(s.workdir, InfoFileName)
 	if pathExist(infoFilePath) {
@@ -263,20 +254,31 @@ func (s *Slave) startSendingFilesToPeer(conn net.Conn) {
 	defer s.fileMu.Unlock()
 	defer conn.Close()
 
+	s.mu.RLock()
+	files := make(map[string]FileStore)
+	for _, f := range s.files {
+		files[f.Filename] = f
+	}
+	s.mu.RUnlock()
+
 	// receiving peer slave addr for sending files
 	buf := make([]byte, 100)
 	n := mustRead(conn, buf)
-	peerAddr := string(buf[:n])
+	data := string(buf[:n])
+	toks := strings.Split(data, "#")
+	peerAddr, peerTag := toks[0], toks[1]
+	peerGroupId, peerId := nodeTag2GroupIdAndPeerId(peerTag)
+
 	// responding "OK
 	mustWrite(conn, []byte("OK"))
 
-	for _, f := range s.files {
-		path := filepath.Join(s.workdir, f.Filename)
+	for _, f := range files {
+		path := filepath.Join(s.workdir, BackupDirName, f.Filename)
 		ext := getExtname(f.Filename)
 		if ext != ".tsm" {
 			continue
 		}
-		err := sendFile(path, ext, peerAddr, f.GroupId, f.PeerId)
+		err := sendFile(path, ext, peerAddr, peerGroupId, peerId)
 		if err != nil {
 			log.Printf("slave %s unable to send file \"%s\" to the remote peer %s", s.host, path, peerAddr)
 		}
@@ -287,26 +289,35 @@ func (s *Slave) backupFileToInfluxDB() {
 	s.fileMu.Lock()
 	defer s.fileMu.Unlock()
 
-	_, filename, _, ok := runtime.Caller(1)
-	if !ok {
-		log.Fatal("Unable to get current path.")
-	}
-	currentPath := path.Dir(filename)
+	currentPath := getCurrentPath()
 	datadir := filepath.Join(currentPath, s.workdir, "data")
+	if !pathExist(datadir) {
+		log.Printf("datadir %s not found", datadir)
+		return
+	}
 	dataFilePath := filepath.Join(currentPath, s.workdir, DataFileName)
 
-	cmd := exec.Command("./bin/influx_inspect", "export", "-datadir", datadir, "-out", dataFilePath)
+	// make a dummy WAL dir, which is needed by influx_inspect
+	waldir := filepath.Join(currentPath, s.workdir, "wal")
+	os.Mkdir(waldir, os.ModePerm)
+
+	cmd := exec.Command("./bin/influx_inspect", "export", "-datadir", datadir, "-waldir", waldir, "-out", dataFilePath)
 	err := cmd.Run()
 	if err != nil {
-		log.Print("Failed to export data file:", err)
+		log.Printf("Failed to export data file: %v", err)
 		return
 	}
 	log.Print("Succeeded to export data file")
 
-	cmd = exec.Command("./bin/influx", "-import", fmt.Sprintf("-path=%s", dataFilePath))
+	port, err := getInfluxDBServicePort(s.id, "service_port.json")
+	if err != nil {
+		log.Printf("Failed to get InfluxDB service port: %v", err)
+		return
+	}
+	cmd = exec.Command("./bin/influx", fmt.Sprintf("-port=%d", port), "-import", fmt.Sprintf("-path=%s", dataFilePath))
 	err = cmd.Run()
 	if err != nil {
-		log.Print("Failed to import file to InfluxDB:", err)
+		log.Printf("Failed to import file to InfluxDB: %v", err)
 		return
 	}
 	log.Print("Succeeded to import file to InfluxDB")
@@ -315,8 +326,58 @@ func (s *Slave) backupFileToInfluxDB() {
 	// TODO 修改 s.files 里相关文件的记录项
 	dir, _ := ioutil.ReadDir(s.workdir)
 	for _, f := range dir {
-		os.RemoveAll(filepath.Join(s.workdir, f.Name()))
+		if f.Name() == DataDirName {
+			os.Mkdir(filepath.Join(s.workdir, BackupDirName), os.ModePerm)
+			oldpath := filepath.Join(s.workdir, f.Name())
+			newpath := filepath.Join(s.workdir, BackupDirName)
+			if err := moveAll(oldpath, newpath); err != nil {
+				panic(err)
+			}
+		} else if f.Name() != BackupDirName &&
+			f.Name() != InfoFileName {
+			os.RemoveAll(filepath.Join(s.workdir, f.Name()))
+		}
 	}
+}
+
+func moveAll(oldpath, newpath string) error {
+	cmd := exec.Command("rsync", "-r", oldpath, newpath)
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	if err := os.RemoveAll(oldpath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getCurrentPath() string {
+	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		panic(err)
+	}
+	return dir
+}
+
+func getInfluxDBServicePort(slaveId int, filename string) (int, error) {
+	file, err := os.OpenFile(filename, os.O_RDONLY, 0664)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	dec := json.NewDecoder(file)
+	data := make(map[string]int)
+	if err = dec.Decode(&data); err != nil {
+		return 0, err
+	}
+
+	port, ok := data[strconv.Itoa(slaveId)]
+	if !ok {
+		return 0, fmt.Errorf("service port not found")
+	}
+	return port, nil
 }
 
 func getExtname(filename string) string {
@@ -352,7 +413,7 @@ func http_put(url string, reqBody string) bool {
 
 func doRecvFile(workDir, filename string, conn net.Conn) ([]byte, error) {
 	dir := filepath.Join(workDir, filepath.Dir(filename))
-	os.MkdirAll(dir, 0777)
+	os.MkdirAll(dir, os.ModePerm)
 
 	f, err := os.Create(filepath.Join(workDir, filename))
 	if err != nil {
@@ -392,7 +453,7 @@ func sendFile(filename, ext, server string, groupId, peerId int) error {
 	defer f.Close()
 
 	// sending filename
-	idx := strings.Index(filename, "data/")
+	idx := strings.Index(filename, DataDirName)
 	filename = filename[idx:]
 	filename = attachGroupIdAndPeerIdToFilename(filename, ext, groupId, peerId)
 	log.Printf("[%s - %s] sending filename ", conn.RemoteAddr(), filename)
@@ -497,4 +558,18 @@ func correctSeparator(s string) string {
 	s = strings.ReplaceAll(s, "\\", sep)
 	s = strings.ReplaceAll(s, "/", sep)
 	return s
+}
+
+func nodeTag2GroupIdAndPeerId(tag string) (groupId int, peerId int) {
+	var err error
+	toks := strings.Split(tag, "_")
+	groupId, err = strconv.Atoi(toks[0])
+	if err != nil {
+		panic(err)
+	}
+	peerId, err = strconv.Atoi(toks[1])
+	if err != nil {
+		panic(err)
+	}
+	return
 }

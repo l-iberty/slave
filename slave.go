@@ -60,46 +60,46 @@ func NewSlave(id int, host string, port int, cmdport int, masterAddrs []string, 
 }
 
 func (s *Slave) Run() {
-	infoFilePath := filepath.Join(s.workdir, InfoFileName)
-	if pathExist(infoFilePath) {
-		infoFile, err := os.OpenFile(infoFilePath, os.O_RDONLY, 0664)
-		if err != nil {
-			panic(err)
-		}
-		defer infoFile.Close()
+	// infoFilePath := filepath.Join(s.workdir, InfoFileName)
+	// if pathExist(infoFilePath) {
+	// 	infoFile, err := os.OpenFile(infoFilePath, os.O_RDONLY, 0664)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	defer infoFile.Close()
 
-		dec := json.NewDecoder(infoFile)
-		info := map[string]int{}
-		if err := dec.Decode(&info); err != nil {
-			panic(err)
-		}
+	// 	dec := json.NewDecoder(infoFile)
+	// 	info := map[string]int{}
+	// 	if err := dec.Decode(&info); err != nil {
+	// 		panic(err)
+	// 	}
 
-		dir, err := ioutil.ReadDir(s.workdir)
-		if err != nil {
-			panic(err)
-		}
-		for _, fi := range dir {
-			if fi.IsDir() {
-				continue
-			}
-			if getExtname(fi.Name()) != ".tsm" {
-				continue
-			}
-			path := filepath.Join(s.workdir, fi.Name())
-			file, err := os.OpenFile(path, os.O_RDONLY, 0664)
-			if err != nil {
-				panic(err)
-			}
-			fs := FileStore{
-				GroupId:  info["groupId"],
-				PeerId:   info["peerId"],
-				Filename: fi.Name(),
-				Md5sum:   hex.EncodeToString(mustMd5sum(file)),
-			}
-			s.files[fs.Filename] = fs
-			file.Close()
-		}
-	}
+	// 	dir, err := ioutil.ReadDir(s.workdir)
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// 	for _, fi := range dir {
+	// 		if fi.IsDir() {
+	// 			continue
+	// 		}
+	// 		if getExtname(fi.Name()) != ".tsm" {
+	// 			continue
+	// 		}
+	// 		path := filepath.Join(s.workdir, fi.Name())
+	// 		file, err := os.OpenFile(path, os.O_RDONLY, 0664)
+	// 		if err != nil {
+	// 			panic(err)
+	// 		}
+	// 		fs := FileStore{
+	// 			GroupId:  info["groupId"],
+	// 			PeerId:   info["peerId"],
+	// 			Filename: fi.Name(),
+	// 			Md5sum:   hex.EncodeToString(mustMd5sum(file)),
+	// 		}
+	// 		s.files[fs.Filename] = fs
+	// 		file.Close()
+	// 	}
+	// }
 
 	go func() {
 		for {
@@ -176,13 +176,16 @@ func (s *Slave) sendHeartbeat() {
 		FileStores:   files,
 	}
 	reqBody := p.mustMarshal()
+	var success int
 	for i := range s.masterAddrs {
 		url := s.masterAddrs[i] + HeartbeatKey
-		if ok := http_put(url, reqBody); ok {
-			// log.Printf("[slave %d] successfully sending heartbeat to master %s", s.id, s.masterAddrs[i])
+		if err := http_put(url, reqBody); err == nil {
+			success++
 			return
 		}
-		// log.Printf("WARNING: [slave %d] failed sending heartbeat to master %s", s.id, s.masterAddrs[i])
+	}
+	if success == 0 {
+		log.Printf("WARNING: [slave %d] failed sending heartbeat to masters [%v]", s.id, s.masterAddrs)
 	}
 }
 
@@ -292,7 +295,7 @@ func (s *Slave) backupFileToInfluxDB() {
 	currentPath := getCurrentPath()
 	datadir := filepath.Join(currentPath, s.workdir, "data")
 	if !pathExist(datadir) {
-		log.Printf("datadir %s not found", datadir)
+		// log.Printf("datadir %s not found", datadir)
 		return
 	}
 	dataFilePath := filepath.Join(currentPath, s.workdir, DataFileName)
@@ -396,19 +399,19 @@ func pathExist(path string) bool {
 	panic(err)
 }
 
-func http_put(url string, reqBody string) bool {
+func http_put(url string, reqBody string) error {
 	req, err := http.NewRequest("PUT", url, strings.NewReader(reqBody))
 	if err != nil {
-		log.Printf("failed to create http request: %v", err)
-		return false
+		// log.Printf("failed to create http request: %v", err)
+		return err
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("http request error: %v", err)
-		return false
+		// log.Printf("http request error: %v", err)
+		return err
 	}
 	defer resp.Body.Close()
-	return true
+	return nil
 }
 
 func doRecvFile(workDir, filename string, conn net.Conn) ([]byte, error) {
